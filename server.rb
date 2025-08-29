@@ -11,11 +11,21 @@ CLIENT_ID = ENV['SPOTIFY_CLIENT_ID']
 CLIENT_SECRET = ENV['SPOTIFY_CLIENT_SECRET']
 REDIRECT_URI = ENV['SPOTIFY_REDIRECT_URI']
 
+# API Key for the MCP Server
+MCP_API_KEY = ENV['MCP_API_KEY']
+
+# Before filter for API key authentication
+before '/api/*' do
+  unless request.env['HTTP_X_API_KEY'] == MCP_API_KEY
+    halt 401, { error: 'Unauthorized: Invalid API Key' }.to_json
+  end
+end
+
 # Allow requests from our Vue frontend.
 # In a production environment, you would want to restrict this to your actual domain.
 use Rack::Cors do
   allow do
-    origins 'http://localhost:8080', 'http://127.0.0.1:8080' # Assuming Vue dev server runs on port 8080
+    origins 'http://localhost:8080', 'http://127.0.0.1:8080'
     resource '*', headers: :any, methods: %i[get post options]
   end
 end
@@ -110,7 +120,6 @@ class SpotifyMCPServer
     # For now, we will simulate a response.
     prompt = "Generate a fun fact about the track '#{track['name']}' by '#{artist['name']}'."
     
-    # Simulate a response from Mistral AI
     [ 
       "Did you know that the track '#{track['name']}' by #{artist['name']}' is #{track['duration_ms'] / 1000} seconds long?",
       "Fun fact: The artist '#{artist['name']}' is on the track '#{track['name']}'.",
