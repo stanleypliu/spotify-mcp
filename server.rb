@@ -10,12 +10,15 @@ require 'rack/cors'
 CLIENT_ID = ENV['SPOTIFY_CLIENT_ID']
 CLIENT_SECRET = ENV['SPOTIFY_CLIENT_SECRET']
 REDIRECT_URI = ENV['SPOTIFY_REDIRECT_URI']
+MAX_RECCOBEATS_SIZE = 40
 
 # API Key for the MCP Server
 MCP_API_KEY = ENV['MCP_API_KEY']
+puts "Server loaded MCP_API_KEY: #{MCP_API_KEY}"
 
 # Before filter for API key authentication
 before '/api/*' do
+
   unless request.env['HTTP_X_API_KEY'] == MCP_API_KEY
     halt 401, { error: 'Unauthorized: Invalid API Key' }.to_json
   end
@@ -35,27 +38,64 @@ class SpotifyMCPServer
   def initialize(access_token)
     @access_token = access_token
     @spotify_api_base = "https://api.spotify.com/v1"
+    @reccobeats_api_request = "https://api.reccobeats.com/v1"
   end
 
-  def random_fact
-    track = random_track_from_random_playlist
+  def random_track
+    user_playlists = get_user_playlists
+    return nil if user_playlists.empty?
 
-    if track.nil?
-      return { fact: generic_music_trivia }.to_json
+    playlist = user_playlists.sample
+    playlist_tracks = get_playlist_tracks(playlist['id'])
+    return nil if playlist_tracks.empty?
+
+    playlist_tracks.sample['track']
+  end
+
+  def get_playlist_names
+    user_playlists = get_user_playlists
+    return nil if user_playlists.empty?
+
+    user_playlists.map { |playlist| { playlist['id'] => playlist['name'] } }
+  end
+
+  def get_track_names
+    user_playlists = get_user_playlists
+
+    tracks = []
+    user_playlists.each do |playlist|
+      playlist_tracks = get_playlist_tracks(playlist['id'])
+      tracks.concat(playlist_tracks.map { |track_item| { track_item['track']['name'] => track_item['track']['id']  } })
     end
 
-    { fact: fact_from_track(track) }.to_json
+    tracks
+  end
+
+  def get_track_audio_features(track_name) 
+    user_playlists = get_user_playlists
+
+    tracks = []
+    user_playlists.each do |playlist|
+      playlist_tracks = get_playlist_tracks(playlist['id'])
+      tracks.concat(playlist_tracks.map { |track_item| { track_item['track']['name'] => track_item['track']['id']  } })
+    end
+
+    return { error: "No tracks found in playlists for genre '#{genre}'." } if track_ids.empty?
+
+    found_track = tracks.find { |track| track.key?(track_name) }
+
+    return { error: "Couldn't find any track with that name in any of your playlists." } if found_track.nil?
   end
 
   def track_recommendation(genre, mood)
     user_playlists = get_user_playlists
-    return nil if user_playlists.empty?
+    return { error: "No playlists found for this user." } if user_playlists.empty?
 
     genre_playlists = user_playlists.select do |playlist|
       playlist['name'].downcase.include?(genre.downcase)
     end
 
-    return nil if genre_playlists.empty?
+    return { error: "No playlists found for genre '#{genre}'." } if genre_playlists.empty?
 
     track_ids = []
     genre_playlists.each do |playlist|
@@ -63,7 +103,7 @@ class SpotifyMCPServer
       track_ids.concat(playlist_tracks.map { |track_item| track_item['track']['id'] })
     end
 
-    return nil if track_ids.empty?
+    return { error: "No tracks found in playlists for genre '#{genre}'." } if track_ids.empty?
 
     mood_params = case mood.downcase
     when 'happy'
@@ -79,10 +119,12 @@ class SpotifyMCPServer
     end
 
     audio_features_map = {}
-    track_ids.each_slice(100) do |batch|
+    track_ids.each_slice(MAX_RECCOBEATS_SIZE) do |batch|
       audio_features_list = get_audio_features_for_tracks(batch)
+
       audio_features_list.each do |audio_features|
-        audio_features_map[audio_features['id']] = audio_features if audio_features
+        id = audio_features['href'].split('/')[-1]
+        audio_features_map[id] = audio_features if audio_features
       end
     end
 
@@ -97,39 +139,30 @@ class SpotifyMCPServer
       end
     end
 
-    nil
+    { error: "No track found for genre '#{genre}' and mood '#{mood}'" }
+  end
+
+  def get_user_playlists
+    response = spotify_api_request("/me/playlists")
+    response['items'] || []
+  end
+
+  def get_playlist_tracks(playlist_id)
+    tracks = []
+    url = "/playlists/#{playlist_id}/tracks?limit=100"
+    while url
+      response = spotify_api_request(url)
+      tracks.concat(response['items'] || [])
+      url = response['next'] ? response['next'].gsub(@spotify_api_base, '') : nil
+    end
+    tracks
   end
 
   private
 
-  def random_track_from_random_playlist
-    user_playlists = get_user_playlists
-    return nil if user_playlists.empty?
-
-    playlist = user_playlists.sample
-    playlist_tracks = get_playlist_tracks(playlist['id'])
-    return nil if playlist_tracks.empty?
-
-    playlist_tracks.sample['track']
-  end
-
-  def fact_from_track(track)
-    artist = track['artists'].first
-    
-    # In the future, we will make a request to the Mistral AI client here.
-    # For now, we will simulate a response.
-    prompt = "Generate a fun fact about the track '#{track['name']}' by '#{artist['name']}'."
-    
-    [ 
-      "Did you know that the track '#{track['name']}' by #{artist['name']}' is #{track['duration_ms'] / 1000} seconds long?",
-      "Fun fact: The artist '#{artist['name']}' is on the track '#{track['name']}'.",
-      "Here's a tidbit: The album '#{track['album']['name']}' features the track '#{track['name']}'."
-    ].sample
-  end
-
   def get_audio_features_for_tracks(track_ids)
-    response = spotify_api_request("/audio-features?ids=#{track_ids.join(',')}")
-    response['audio_features'] || []
+    response = reccobeats_api_request("/audio-features?ids=#{track_ids.join(',')}")
+    response['content'] || []
   end
 
   def get_track(track_id)
@@ -160,16 +193,6 @@ class SpotifyMCPServer
     end
   end
 
-  def get_user_playlists
-    response = spotify_api_request("/me/playlists")
-    response['items'] || []
-  end
-
-  def get_playlist_tracks(playlist_id)
-    response = spotify_api_request("/playlists/#{playlist_id}/tracks")
-    response['items'] || []
-  end
-
   def spotify_api_request(endpoint)
     uri = URI.parse("#{@spotify_api_base}#{endpoint}")
     http = Net::HTTP.new(uri.host, uri.port)
@@ -183,17 +206,26 @@ class SpotifyMCPServer
     if response.is_a?(Net::HTTPSuccess)
       JSON.parse(response.body)
     else
-      puts "Error from Spotify API: #{response.body}"
+      puts "Error from Spotify API: #{response.body} - endpoint #{endpoint}"
       {}
     end
   end
 
-  def generic_music_trivia
-    [
-      "The first music video ever played on MTV was 'Video Killed the Radio Star' by The Buggles.",
-      "The Beatles have had the most number-one hits on the Billboard Hot 100 chart.",
-      "The best-selling album of all time is 'Thriller' by Michael Jackson."
-    ].sample
+  def reccobeats_api_request(endpoint)
+    uri = URI.parse("#{@reccobeats_api_request}#{endpoint}")
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl = true
+    
+    request = Net::HTTP::Get.new(uri.request_uri)
+    
+    response = http.request(request)
+    
+    if response.is_a?(Net::HTTPSuccess)
+      JSON.parse(response.body)
+    else
+      puts "Error from Reccobeats API: #{response.body} - endpoint #{endpoint}"
+      {}
+    end
   end
 end
 
@@ -227,24 +259,8 @@ get '/callback' do
 
   if response.is_a?(Net::HTTPSuccess)
     response.body
-  else
-    status response.code.to_i
-    response.body
+  else status response.code.to_i response.body
   end
-end
-
-get '/api/v1/random-fact' do
-  content_type :json
-
-  auth_header = request.env['HTTP_AUTHORIZATION']
-  unless auth_header&.start_with?('Bearer ')
-    status 401
-    return { error: 'Access token not found' }.to_json
-  end
-
-  access_token = auth_header.split(' ').last
-  mcp_server = SpotifyMCPServer.new(access_token)
-  mcp_server.random_fact
 end
 
 get '/api/v1/track-recommendation' do
@@ -269,11 +285,32 @@ get '/api/v1/track-recommendation' do
 
   track = mcp_server.track_recommendation(genre, mood)
 
+  if track && track[:error]
+    status 404
+    { error: track[:error] }.to_json
+  else
+    { track: track }.to_json
+  end
+end
+
+get '/api/v1/random-track' do
+  content_type :json
+
+  auth_header = request.env['HTTP_AUTHORIZATION']
+  unless auth_header&.start_with?('Bearer ')
+    status 401
+    return { error: 'Access token not found' }.to_json
+  end
+
+  access_token = auth_header.split(' ').last
+  mcp_server = SpotifyMCPServer.new(access_token)
+  track = mcp_server.random_track
+
   if track
     { track: track }.to_json
   else
     status 404
-    { error: "No track found for genre '#{genre}' and mood '#{mood}'" }.to_json
+    { error: 'Could not find a random track. Ensure the user has playlists and they are not empty.' }.to_json
   end
 end
 
