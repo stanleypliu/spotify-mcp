@@ -8,7 +8,7 @@
     "skipLibCheck": true
   },
   "include": [
-    "test_ai_client.ts",
-    "src/**/*.ts"
+    "src/**/*.ts",
+    "test/**/*.ts"
   ]
 }
