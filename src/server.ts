@@ -3,6 +3,8 @@ import axios from "axios";
 import * as dotenv from "dotenv";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { z } from "zod";
 
 import * as path from "path";
 import * as fs from "fs";
@@ -84,17 +86,28 @@ async function getSpotifyToken(): Promise<string> {
 }
 
 const spotifyApi = axios.create({ baseURL: "https://api.spotify.com/v1" });
+const reccoBeatsApi = axios.create({
+  baseURL: "https://api.reccobeats.com/v1",
+});
 
-async function getUserPlaylists() {
+async function getUserPlaylists(): Promise<CallToolResult> {
   try {
     const token = await getSpotifyToken();
     const response = await spotifyApi.get("/me/playlists", {
       headers: { Authorization: `Bearer ${token}` },
     });
-    return (response.data.items || []).map((p: any) => ({
+    const playlists = (response.data.items || []).map((p: any) => ({
       id: p.id,
       name: p.name,
     }));
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(playlists, null, 2),
+        },
+      ],
+    };
   } catch (error) {
     console.error("Error getting user playlists:", error);
     throw error;
@@ -104,10 +117,16 @@ async function getUserPlaylists() {
 async function getPlaylistTracks(args: {
   playlist_name: string;
   page?: number;
-}) {
+}): Promise<CallToolResult> {
   try {
     const token = await getSpotifyToken();
-    const playlists = await getUserPlaylists();
+    const playlistsResponse = await spotifyApi.get("/me/playlists", {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const playlists = (playlistsResponse.data.items || []).map((p: any) => ({
+      id: p.id,
+      name: p.name,
+    }));
     const playlist = playlists.find(
       (p: any) => p.name.toLowerCase() === args.playlist_name.toLowerCase()
     );
@@ -125,24 +144,40 @@ async function getPlaylistTracks(args: {
       params: { limit: perPage, offset },
     });
 
-    return (response.data.items || []).map((item: any) => ({
+    const tracks = (response.data.items || []).map((item: any) => ({
       id: item.track.id,
       name: item.track.name,
       artist: item.track.artists.map((a: any) => a.name).join(", "),
     }));
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(tracks, null, 2),
+        },
+      ],
+    };
   } catch (error) {
     console.error("Error getting playlist tracks:", error);
     throw error;
   }
 }
 
-async function getTrackAudioFeatures(args: { track_id: string }) {
+async function getTrackAudioFeatures(args: {
+  track_ids: string[];
+}): Promise<CallToolResult> {
   try {
-    const token = await getSpotifyToken();
-    const response = await spotifyApi.get(`/audio-features/${args.track_id}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    return response.data;
+    const response = await reccoBeatsApi.get(
+      `/audio-features?ids=${args.track_ids.join()}`
+    );
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(response.data.content, null, 2),
+        },
+      ],
+    };
   } catch (error) {
     console.error("Error getting track audio features:", error);
     throw error;
@@ -227,57 +262,39 @@ async function main() {
     const mcpServer = new McpServer({
       name: "Spotify MCP Server",
       version: "1.0.0",
-      tools: [
-        {
-          name: "get_user_playlists",
-          description: "Gets a list of the user's Spotify playlists.",
-          input_schema: { type: "object", properties: {} },
-          run: async () => await getUserPlaylists(),
-        },
-        {
-          name: "get_playlist_tracks",
-          description:
-            "Gets a paginated list of tracks from a user's specific playlist by name.",
-          input_schema: {
-            type: "object",
-            properties: {
-              playlist_name: {
-                type: "string",
-                description: "The name of the playlist.",
-              },
-              page: {
-                type: "integer",
-                description: "The page number to retrieve.",
-                default: 1,
-              },
-            },
-            required: ["playlist_name"],
-          },
-          run: async (args: any) => await getPlaylistTracks(args as any),
-        },
-        {
-          name: "get_track_audio_features",
-          description:
-            "Gets the audio features for a single track, given its unique ID.",
-          input_schema: {
-            type: "object",
-            properties: {
-              track_id: {
-                type: "string",
-                description: "The unique Spotify ID of the track.",
-              },
-            },
-            required: ["track_id"],
-          },
-          run: async (args: any) => await getTrackAudioFeatures(args as any),
-        },
-      ],
-      rpc: {
-        'tools/list': async () => [],
-        'prompts/list': async () => [],
-        'resources/list': async () => [],
+      capabilities: {
+        resources: {},
+        tools: {},
       },
     });
+
+    mcpServer.tool(
+      "get_user_playlists",
+      "Gets a list of the user's Spotify playlists.",
+      {},
+      async () => await getUserPlaylists()
+    );
+
+    mcpServer.tool(
+      "get_playlist_tracks",
+      "Gets a paginated list of tracks from a user's specific playlist by name.",
+      {
+        playlist_name: z.string().describe("The name of the playlist."),
+        page: z.number().default(1).describe("The page number to retrieve."),
+      },
+      async (args: any) => await getPlaylistTracks(args as any)
+    );
+
+    mcpServer.tool(
+      "get_track_audio_features",
+      "Gets the audio features for multiple tracks, given unique IDs.",
+      {
+        track_ids: z
+          .array(z.string())
+          .describe("The Spotify IDs of the tracks."),
+      },
+      async (args: any) => await getTrackAudioFeatures(args as any)
+    );
 
     const transport = new StdioServerTransport();
 
